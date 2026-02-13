@@ -33,6 +33,7 @@ const App: React.FC = () => {
   const [showJoinModal, setShowJoinModal] = useState(false);
   const [newRoomName, setNewRoomName] = useState('');
   const [joinCode, setJoinCode] = useState('');
+  const [isProcessing, setIsProcessing] = useState(false);
 
   const [rooms, setRooms] = useState<ChatRoom[]>([]);
   const [activeRoomId, setActiveRoomId] = useState<string>('');
@@ -76,22 +77,32 @@ const App: React.FC = () => {
     }
   }, []);
 
-  // Fetch Joined Rooms Only
+  // Fetch Joined Rooms Only (Index-free query)
   useEffect(() => {
     if (!db || !currentUser) return;
-    // 自分が参加者リスト(participants)に含まれているルームのみを取得
+    
+    // orderByを削除することで、Firestore側の複合インデックス設定を不要にします。
+    // その代わり、取得後にJavaScript側でソートを行います。
     const q = query(
       collection(db, 'rooms'), 
-      where('participants', 'array-contains', currentUser.id),
-      orderBy('createdAt', 'desc')
+      where('participants', 'array-contains', currentUser.id)
     );
+
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const roomList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as ChatRoom));
+      // 作成日時順にソート（新しい順）
+      roomList.sort((a, b) => b.createdAt - a.createdAt);
+      
       setRooms(roomList);
+      
+      // 最初の一つを選択（未選択の場合のみ）
       if (roomList.length > 0 && !activeRoomId) {
         setActiveRoomId(roomList[0].id);
       }
+    }, (error) => {
+      console.error("Rooms sync error:", error);
     });
+    
     return () => unsubscribe();
   }, [db, currentUser]);
 
@@ -121,51 +132,66 @@ const App: React.FC = () => {
   };
 
   const createRoom = async () => {
-    if (!newRoomName.trim() || !currentUser) return;
+    if (!newRoomName.trim() || !currentUser || !db || isProcessing) return;
+    
+    setIsProcessing(true);
     const code = Math.random().toString(36).substring(2, 8).toUpperCase();
+    
     try {
       const docRef = await addDoc(collection(db, 'rooms'), {
-        name: newRoomName,
+        name: newRoomName.trim(),
         code,
         createdBy: currentUser.id,
         createdAt: Date.now(),
-        participants: [currentUser.id] // 作成者を自動的に参加者に追加
+        participants: [currentUser.id]
       });
+      
+      // 成功時の処理
       setActiveRoomId(docRef.id);
       setNewRoomName('');
       setShowCreateModal(false);
       setIsSidebarOpen(false);
-    } catch (e) {
-      alert("ルーム作成に失敗しました。");
+    } catch (e: any) {
+      console.error("Create room error:", e);
+      alert("ルーム作成に失敗しました: " + e.message);
+    } finally {
+      setIsProcessing(false);
     }
   };
 
   const joinRoomByCode = async () => {
-    if (!joinCode.trim() || !currentUser) return;
-    const q = query(collection(db, 'rooms'), where('code', '==', joinCode.toUpperCase()));
-    const snapshot = await getDocs(q);
-    if (snapshot.empty) {
-      alert("該当するコードのルームが見つかりません。");
-    } else {
-      const roomDoc = snapshot.docs[0];
-      const roomId = roomDoc.id;
-      const roomData = roomDoc.data();
-
-      // すでに参加していないかチェック
-      if (roomData.participants && roomData.participants.includes(currentUser.id)) {
-        setActiveRoomId(roomId);
-        alert("すでにご参加いただいているルームです。");
+    if (!joinCode.trim() || !currentUser || !db || isProcessing) return;
+    
+    setIsProcessing(true);
+    try {
+      const q = query(collection(db, 'rooms'), where('code', '==', joinCode.trim().toUpperCase()));
+      const snapshot = await getDocs(q);
+      
+      if (snapshot.empty) {
+        alert("該当するコードのルームが見つかりません。");
       } else {
-        // 参加者リストに追加
-        await updateDoc(doc(db, 'rooms', roomId), {
-          participants: arrayUnion(currentUser.id)
-        });
-        setActiveRoomId(roomId);
-        alert("ルームに参加しました！");
+        const roomDoc = snapshot.docs[0];
+        const roomId = roomDoc.id;
+        const roomData = roomDoc.data();
+
+        if (roomData.participants && roomData.participants.includes(currentUser.id)) {
+          setActiveRoomId(roomId);
+        } else {
+          await updateDoc(doc(db, 'rooms', roomId), {
+            participants: arrayUnion(currentUser.id)
+          });
+          setActiveRoomId(roomId);
+          alert("ルームに参加しました！");
+        }
+        setJoinCode('');
+        setShowJoinModal(false);
+        setIsSidebarOpen(false);
       }
-      setJoinCode('');
-      setShowJoinModal(false);
-      setIsSidebarOpen(false);
+    } catch (e: any) {
+      console.error("Join room error:", e);
+      alert("参加に失敗しました。");
+    } finally {
+      setIsProcessing(false);
     }
   };
 
@@ -207,7 +233,7 @@ const App: React.FC = () => {
     }
   };
 
-  if (initError) return <div className="p-10 text-red-500 font-bold bg-white h-screen">Error: {initError}</div>;
+  if (initError) return <div className="p-10 text-red-500 font-bold bg-white h-screen">Firebase Error: {initError}</div>;
   
   if (!currentUser) return (
     <div className="h-screen flex items-center justify-center bg-[#0d3b36] p-6 text-center">
@@ -382,10 +408,23 @@ const App: React.FC = () => {
           <div className="bg-white rounded-[2.5rem] p-8 w-full max-w-sm shadow-2xl animate-in zoom-in duration-300">
             <h3 className="font-black text-xl mb-4 text-slate-800">新しいルームを作成</h3>
             <p className="text-xs text-slate-500 mb-6 italic leading-relaxed">作成したルームには招待コードが発行されます。<br/>他のスタッフに参加してもらう際に共有してください。</p>
-            <input value={newRoomName} onChange={e => setNewRoomName(e.target.value)} placeholder="例：受付連絡、オペ室" className="w-full p-4 bg-slate-100 rounded-2xl outline-none focus:ring-4 focus:ring-teal-100 mb-6 font-bold" autoFocus />
+            <input 
+              value={newRoomName} 
+              onChange={e => setNewRoomName(e.target.value)} 
+              placeholder="例：受付連絡、オペ室" 
+              className="w-full p-4 bg-slate-100 rounded-2xl outline-none focus:ring-4 focus:ring-teal-100 mb-6 font-bold" 
+              autoFocus 
+              onKeyDown={e => e.key === 'Enter' && createRoom()}
+            />
             <div className="flex gap-3">
               <button onClick={() => setShowCreateModal(false)} className="flex-1 py-4 font-black text-slate-400">閉じる</button>
-              <button onClick={createRoom} className="flex-1 py-4 bg-teal-600 text-white rounded-2xl font-black shadow-lg">作成する</button>
+              <button 
+                onClick={createRoom} 
+                disabled={isProcessing || !newRoomName.trim()}
+                className="flex-1 py-4 bg-teal-600 text-white rounded-2xl font-black shadow-lg disabled:opacity-50"
+              >
+                {isProcessing ? '作成中...' : '作成する'}
+              </button>
             </div>
           </div>
         </div>
@@ -397,10 +436,23 @@ const App: React.FC = () => {
           <div className="bg-white rounded-[2.5rem] p-8 w-full max-w-sm shadow-2xl animate-in zoom-in duration-300">
             <h3 className="font-black text-xl mb-2 text-slate-800">ルームに参加</h3>
             <p className="text-xs text-slate-500 mb-6 leading-relaxed">共有された6桁のコードを入力してください。<br/>一度参加すると一覧に保存されます。</p>
-            <input value={joinCode} onChange={e => setJoinCode(e.target.value.toUpperCase())} maxLength={6} placeholder="ABCDEF" className="w-full p-5 bg-slate-100 rounded-2xl outline-none focus:ring-4 focus:ring-blue-100 mb-6 text-center font-mono text-3xl tracking-[0.4em] font-black" />
+            <input 
+              value={joinCode} 
+              onChange={e => setJoinCode(e.target.value.toUpperCase())} 
+              maxLength={6} 
+              placeholder="ABCDEF" 
+              className="w-full p-5 bg-slate-100 rounded-2xl outline-none focus:ring-4 focus:ring-blue-100 mb-6 text-center font-mono text-3xl tracking-[0.4em] font-black" 
+              onKeyDown={e => e.key === 'Enter' && joinRoomByCode()}
+            />
             <div className="flex gap-3">
               <button onClick={() => setShowJoinModal(false)} className="flex-1 py-4 font-black text-slate-400">閉じる</button>
-              <button onClick={joinRoomByCode} className="flex-1 py-4 bg-blue-600 text-white rounded-2xl font-black shadow-lg">参加する</button>
+              <button 
+                onClick={joinRoomByCode} 
+                disabled={isProcessing || joinCode.length < 6}
+                className="flex-1 py-4 bg-blue-600 text-white rounded-2xl font-black shadow-lg disabled:opacity-50"
+              >
+                {isProcessing ? '照合中...' : '参加する'}
+              </button>
             </div>
           </div>
         </div>
