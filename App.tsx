@@ -3,15 +3,14 @@ import React, { useState, useEffect, useRef } from 'react';
 import { initializeApp } from 'firebase/app';
 import { getFirestore, collection, addDoc, onSnapshot, query, orderBy, limit } from 'firebase/firestore';
 import { getAuth, signInWithPopup, GoogleAuthProvider, onAuthStateChanged } from 'firebase/auth';
-import { User, Message, ChatRoom, SummaryResponse } from './types';
-// Vite環境での解決を助けるため、パスを再確認
-import { summarizeChat } from './services/geminiService';
-import { logToGoogleSheets, processImage } from './services/storageService';
+import { User, Message, ChatRoom, SummaryResponse } from './types.ts';
+// 拡張子 .ts を追加してビルドエラーを回避
+import { summarizeChat } from './services/geminiService.ts';
+import { logToGoogleSheets, processImage } from './services/storageService.ts';
 
 // Firebase設定のパースエラーを防ぐ
 const getFirebaseConfig = () => {
   try {
-    // FIX: Access process.env and import.meta.env with any casting to satisfy TS error
     const config = (process as any).env?.FIREBASE_CONFIG || (import.meta as any).env?.VITE_FIREBASE_CONFIG;
     return config ? JSON.parse(config) : null;
   } catch (e) {
@@ -74,7 +73,6 @@ const App: React.FC = () => {
       limit(100)
     );
 
-    // FIX: Explicitly cast snapshot to any to bypass Property 'docs' does not exist error
     const unsubscribe = onSnapshot(q, (snapshot: any) => {
       const newMessages = snapshot.docs.map((doc: any) => ({
         id: doc.id,
