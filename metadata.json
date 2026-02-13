@@ -1,0 +1,7 @@
+{
+  "name": "なないろ歯科 院内チャット",
+  "description": "なないろ歯科・こども矯正歯科クリニック向けの、AI要約機能・Google連携機能を備えた高機能院内チャットアプリ。",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
