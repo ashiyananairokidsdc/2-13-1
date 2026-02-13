@@ -1,7 +1,7 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { initializeApp, getApps } from 'firebase/app';
-import { getFirestore, collection, addDoc, onSnapshot, query, orderBy, limit, doc, deleteDoc, where, getDocs, updateDoc, arrayUnion } from 'firebase/firestore';
+import { getFirestore, collection, addDoc, onSnapshot, query, orderBy, limit, doc, deleteDoc, where, getDocs, updateDoc, arrayUnion, setDoc } from 'firebase/firestore';
 import { getAuth, signInWithPopup, GoogleAuthProvider, onAuthStateChanged, signOut } from 'firebase/auth';
 import { User, Message, ChatRoom, SummaryResponse } from './types';
 import { summarizeChat } from './geminiService';
@@ -31,6 +31,7 @@ const App: React.FC = () => {
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [showJoinModal, setShowJoinModal] = useState(false);
+  const [showMembersModal, setShowMembersModal] = useState(false);
   const [newRoomName, setNewRoomName] = useState('');
   const [joinCode, setJoinCode] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
@@ -38,6 +39,7 @@ const App: React.FC = () => {
   const [rooms, setRooms] = useState<ChatRoom[]>([]);
   const [activeRoomId, setActiveRoomId] = useState<string>('');
   const [messages, setMessages] = useState<Message[]>([]);
+  const [roomMembers, setRoomMembers] = useState<User[]>([]);
   
   const [inputText, setInputText] = useState('');
   const [isImportant, setIsImportant] = useState(false);
@@ -58,15 +60,18 @@ const App: React.FC = () => {
         setAuth(_auth);
         setIsFirebaseReady(true);
 
-        onAuthStateChanged(_auth, (user) => {
+        onAuthStateChanged(_auth, async (user) => {
           if (user) {
-            setCurrentUser({
+            const userData: User = {
               id: user.uid,
               name: user.displayName || '名無しスタッフ',
               email: user.email || '',
               photoURL: user.photoURL || `https://api.dicebear.com/7.x/avataaars/svg?seed=${user.uid}`,
               role: 'staff'
-            });
+            };
+            setCurrentUser(userData);
+            // ユーザー情報をFirestoreに保存（メンバー一覧表示用）
+            await setDoc(doc(_db, 'users', user.uid), userData, { merge: true });
           } else {
             setCurrentUser(null);
           }
@@ -77,44 +82,68 @@ const App: React.FC = () => {
     }
   }, []);
 
-  // Fetch Joined Rooms Only (Index-free query)
+  // Fetch Joined Rooms Only
   useEffect(() => {
     if (!db || !currentUser) return;
-    
-    // orderByを削除することで、Firestore側の複合インデックス設定を不要にします。
-    // その代わり、取得後にJavaScript側でソートを行います。
     const q = query(
       collection(db, 'rooms'), 
       where('participants', 'array-contains', currentUser.id)
     );
-
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const roomList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as ChatRoom));
-      // 作成日時順にソート（新しい順）
       roomList.sort((a, b) => b.createdAt - a.createdAt);
-      
       setRooms(roomList);
-      
-      // 最初の一つを選択（未選択の場合のみ）
       if (roomList.length > 0 && !activeRoomId) {
         setActiveRoomId(roomList[0].id);
       }
-    }, (error) => {
-      console.error("Rooms sync error:", error);
     });
-    
     return () => unsubscribe();
   }, [db, currentUser]);
 
-  // Fetch Messages for active room
+  // Fetch Messages and Auto-Mark as Read
   useEffect(() => {
-    if (!db || !activeRoomId) return;
+    if (!db || !activeRoomId || !currentUser) return;
     const q = query(collection(db, 'rooms', activeRoomId, 'messages'), orderBy('timestamp', 'asc'), limit(100));
     const unsubscribe = onSnapshot(q, (snapshot) => {
-      setMessages(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Message)));
+      const fetchedMessages = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Message));
+      setMessages(fetchedMessages);
+
+      // 未読メッセージを既読にする
+      fetchedMessages.forEach(async (msg) => {
+        if (msg.senderId !== currentUser.id && !msg.readBy.includes(currentUser.id)) {
+          await updateDoc(doc(db, 'rooms', activeRoomId, 'messages', msg.id), {
+            readBy: arrayUnion(currentUser.id)
+          });
+        }
+      });
     });
     return () => unsubscribe();
-  }, [db, activeRoomId]);
+  }, [db, activeRoomId, currentUser]);
+
+  // Fetch Room Members info
+  useEffect(() => {
+    if (!db || !activeRoomId || !rooms.length) return;
+    const room = rooms.find(r => r.id === activeRoomId);
+    if (!room) return;
+
+    const fetchMembers = async () => {
+      const memberData: User[] = [];
+      // 10件ずつのチャンクで取得（Firestoreのinクエリ制限対策）
+      const chunks = [];
+      for (let i = 0; i < room.participants.length; i += 10) {
+        chunks.push(room.participants.slice(i, i + 10));
+      }
+
+      for (const chunk of chunks) {
+        const q = query(collection(db, 'users'), where('id', 'in', chunk));
+        const snap = await getDocs(q);
+        snap.forEach(doc => memberData.push(doc.data() as User));
+      }
+      setRoomMembers(memberData);
+    };
+
+    fetchMembers();
+  }, [db, activeRoomId, rooms]);
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -127,16 +156,14 @@ const App: React.FC = () => {
     try {
       await signInWithPopup(auth, new GoogleAuthProvider());
     } catch (e: any) {
-      alert("ログイン失敗: 承認済みドメインを確認してください。");
+      alert("ログイン失敗");
     }
   };
 
   const createRoom = async () => {
     if (!newRoomName.trim() || !currentUser || !db || isProcessing) return;
-    
     setIsProcessing(true);
     const code = Math.random().toString(36).substring(2, 8).toUpperCase();
-    
     try {
       const docRef = await addDoc(collection(db, 'rooms'), {
         name: newRoomName.trim(),
@@ -145,15 +172,12 @@ const App: React.FC = () => {
         createdAt: Date.now(),
         participants: [currentUser.id]
       });
-      
-      // 成功時の処理
       setActiveRoomId(docRef.id);
       setNewRoomName('');
       setShowCreateModal(false);
       setIsSidebarOpen(false);
     } catch (e: any) {
-      console.error("Create room error:", e);
-      alert("ルーム作成に失敗しました: " + e.message);
+      alert("失敗: " + e.message);
     } finally {
       setIsProcessing(false);
     }
@@ -161,35 +185,28 @@ const App: React.FC = () => {
 
   const joinRoomByCode = async () => {
     if (!joinCode.trim() || !currentUser || !db || isProcessing) return;
-    
     setIsProcessing(true);
     try {
       const q = query(collection(db, 'rooms'), where('code', '==', joinCode.trim().toUpperCase()));
       const snapshot = await getDocs(q);
-      
       if (snapshot.empty) {
-        alert("該当するコードのルームが見つかりません。");
+        alert("コードが見つかりません。");
       } else {
         const roomDoc = snapshot.docs[0];
         const roomId = roomDoc.id;
         const roomData = roomDoc.data();
-
-        if (roomData.participants && roomData.participants.includes(currentUser.id)) {
-          setActiveRoomId(roomId);
-        } else {
+        if (!roomData.participants?.includes(currentUser.id)) {
           await updateDoc(doc(db, 'rooms', roomId), {
             participants: arrayUnion(currentUser.id)
           });
-          setActiveRoomId(roomId);
-          alert("ルームに参加しました！");
         }
+        setActiveRoomId(roomId);
         setJoinCode('');
         setShowJoinModal(false);
         setIsSidebarOpen(false);
       }
     } catch (e: any) {
-      console.error("Join room error:", e);
-      alert("参加に失敗しました。");
+      alert("エラーが発生しました。");
     } finally {
       setIsProcessing(false);
     }
@@ -202,7 +219,7 @@ const App: React.FC = () => {
       await deleteDoc(doc(db, 'rooms', roomId));
       if (activeRoomId === roomId) setActiveRoomId('');
     } catch (e) {
-      alert("削除に失敗しました。作成者のみ削除可能です。");
+      alert("削除に失敗しました。");
     }
   };
 
@@ -233,7 +250,7 @@ const App: React.FC = () => {
     }
   };
 
-  if (initError) return <div className="p-10 text-red-500 font-bold bg-white h-screen">Firebase Error: {initError}</div>;
+  if (initError) return <div className="p-10 text-red-500 font-bold bg-white h-screen">Error: {initError}</div>;
   
   if (!currentUser) return (
     <div className="h-screen flex items-center justify-center bg-[#0d3b36] p-6 text-center">
@@ -273,11 +290,6 @@ const App: React.FC = () => {
 
         <div className="flex-1 overflow-y-auto px-2 space-y-1">
           <div className="px-4 py-2 text-[10px] font-black text-slate-400 uppercase tracking-widest">参加中のルーム</div>
-          {rooms.length === 0 && (
-            <div className="px-4 py-10 text-center">
-              <p className="text-xs text-slate-400 italic">参加しているルームが<br/>ありません</p>
-            </div>
-          )}
           {rooms.map(room => (
             <div
               key={room.id}
@@ -304,7 +316,7 @@ const App: React.FC = () => {
           <img src={currentUser.photoURL} className="w-10 h-10 rounded-full border-2 border-white shadow-sm" alt="User"/>
           <div className="flex-1 min-w-0">
             <p className="text-xs font-black text-slate-700 truncate">{currentUser.name}</p>
-            <button onClick={() => signOut(auth)} className="text-[9px] font-bold text-red-500 hover:underline">ログアウト</button>
+            <button onClick={() => signOut(auth)} className="text-[9px] font-bold text-red-500">ログアウト</button>
           </div>
         </div>
       </aside>
@@ -316,7 +328,14 @@ const App: React.FC = () => {
             <button onClick={() => setIsSidebarOpen(true)} className="lg:hidden w-10 h-10 flex items-center justify-center text-slate-500 bg-slate-100 rounded-xl active:bg-slate-200"><i className="fa-solid fa-bars-staggered text-xl"></i></button>
             <div className="overflow-hidden">
               <h2 className="font-black text-lg text-slate-800 truncate leading-none mb-1">{activeRoom?.name || 'ルーム未選択'}</h2>
-              {activeRoom && <p className="text-[10px] text-teal-600 font-bold font-mono">CODE: {activeRoom.code}</p>}
+              {activeRoom && (
+                <div className="flex items-center gap-2">
+                  <p className="text-[10px] text-teal-600 font-bold font-mono">CODE: {activeRoom.code}</p>
+                  <button onClick={() => setShowMembersModal(true)} className="text-[10px] bg-slate-100 text-slate-500 px-2 py-0.5 rounded-full font-black hover:bg-slate-200 flex items-center gap-1">
+                    <i className="fa-solid fa-users"></i> {activeRoom.participants.length}名
+                  </button>
+                </div>
+              )}
             </div>
           </div>
           <button 
@@ -341,22 +360,16 @@ const App: React.FC = () => {
                 <i className="fa-solid fa-door-open text-5xl opacity-20"></i>
               </div>
               <h3 className="font-black text-lg text-slate-600 mb-2">まだルームに参加していません</h3>
-              <p className="text-sm mb-8 leading-relaxed">右下のボタン、または左上のメニューから<br/>ルームの作成か参加（コード入力）を行ってください。</p>
-              <div className="flex gap-4">
-                <button onClick={() => setShowCreateModal(true)} className="px-6 py-3 bg-teal-600 text-white rounded-2xl font-black shadow-lg shadow-teal-100">新しく作る</button>
-                <button onClick={() => setShowJoinModal(true)} className="px-6 py-3 bg-slate-100 text-slate-600 rounded-2xl font-black">コードで参加</button>
-              </div>
+              <p className="text-sm mb-8 leading-relaxed">まずはルームを作成するか、<br/>招待コードで参加してください。</p>
             </div>
           ) : !activeRoomId ? (
-            <div className="h-full flex flex-col items-center justify-center text-slate-300 italic"><i className="fa-solid fa-arrow-left text-5xl mb-4 opacity-10"></i><p>左のメニューからルームを選択してください</p></div>
-          ) : messages.length === 0 ? (
-            <div className="h-full flex flex-col items-center justify-center text-slate-300">
-               <i className="fa-solid fa-comment-dots text-5xl mb-4 opacity-10"></i>
-               <p className="text-sm font-bold">メッセージがありません。会話を始めましょう！</p>
-            </div>
+            <div className="h-full flex flex-col items-center justify-center text-slate-300 italic"><p>ルームを選択してください</p></div>
           ) : (
             messages.map((msg, i) => {
               const isMe = msg.senderId === currentUser.id;
+              // 送信者以外で既読にした人数
+              const readCount = msg.readBy.filter(id => id !== msg.senderId).length;
+              
               return (
                 <div key={msg.id} className={`flex gap-3 ${isMe ? 'flex-row-reverse' : ''} animate-in fade-in slide-in-from-bottom-2 duration-300`}>
                   <img src={msg.senderPhoto} className="w-8 h-8 rounded-full border-2 border-white shadow-sm self-end mb-1" />
@@ -366,7 +379,11 @@ const App: React.FC = () => {
                       {msg.isImportant && <span className="absolute -top-2 -left-2 bg-amber-500 text-white w-6 h-6 rounded-full flex items-center justify-center text-[10px] shadow-md border-2 border-white font-black">!</span>}
                       {msg.imageUrl && <img src={msg.imageUrl} className="rounded-xl mb-3 max-w-full border border-slate-200" onClick={() => window.open(msg.imageUrl)}/>}
                       <p className="whitespace-pre-wrap">{msg.text}</p>
-                      <div className={`text-[8px] mt-2 font-bold ${isMe ? 'text-teal-200 text-right' : 'text-slate-400'}`}>{new Date(msg.timestamp).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</div>
+                      
+                      <div className={`flex items-center gap-2 mt-2 ${isMe ? 'flex-row-reverse justify-start' : 'justify-end'}`}>
+                        {readCount > 0 && <span className={`text-[8px] font-black ${isMe ? 'text-teal-200' : 'text-slate-400'}`}>既読 {readCount}</span>}
+                        <div className={`text-[8px] font-bold ${isMe ? 'text-teal-200' : 'text-slate-400'}`}>{new Date(msg.timestamp).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</div>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -382,49 +399,51 @@ const App: React.FC = () => {
               const file = e.target.files?.[0];
               if(file) handleSendMessage(undefined, await processImage(file));
             }} className="hidden" accept="image/*" />
-            
-            <div className="flex-1 bg-slate-50 rounded-[1.5rem] p-2 border border-slate-200 focus-within:border-teal-400 focus-within:ring-4 focus-within:ring-teal-100 transition-all shadow-inner">
-              <textarea
-                value={inputText}
-                onChange={e => setInputText(e.target.value)}
-                placeholder="メッセージを入力..."
-                rows={1}
-                className="bg-transparent w-full px-3 py-2 outline-none text-[13px] sm:text-sm resize-none max-h-32"
-                onKeyDown={e => { if(e.key==='Enter' && !e.shiftKey) { e.preventDefault(); handleSendMessage(); }}}
-              />
+            <div className="flex-1 bg-slate-50 rounded-[1.5rem] p-2 border border-slate-200 focus-within:border-teal-400 transition-all">
+              <textarea value={inputText} onChange={e => setInputText(e.target.value)} placeholder="メッセージを入力..." rows={1} className="bg-transparent w-full px-3 py-2 outline-none text-sm resize-none" onKeyDown={e => { if(e.key==='Enter' && !e.shiftKey) { e.preventDefault(); handleSendMessage(); }}} />
               <div className="flex justify-between items-center px-2 pb-1">
-                <button type="button" onClick={() => setIsImportant(!isImportant)} className={`text-[10px] px-3 py-1 rounded-full border-2 font-black transition-all ${isImportant ? 'bg-amber-400 text-white border-amber-500 shadow-sm' : 'text-slate-400 bg-white border-slate-200'}`}>重要マーク</button>
+                <button type="button" onClick={() => setIsImportant(!isImportant)} className={`text-[10px] px-3 py-1 rounded-full border-2 font-black ${isImportant ? 'bg-amber-400 text-white border-amber-500' : 'text-slate-400 bg-white border-slate-200'}`}>重要マーク</button>
               </div>
             </div>
-            
-            <button type="submit" disabled={!inputText.trim() && !activeRoomId} className={`w-12 h-12 rounded-2xl flex items-center justify-center transition-all shadow-lg ${inputText.trim() ? 'bg-teal-600 text-white active:scale-90 shadow-teal-100' : 'bg-slate-100 text-slate-300 shadow-none'}`}><i className="fa-solid fa-paper-plane text-xl"></i></button>
+            <button type="submit" disabled={!inputText.trim() && !activeRoomId} className={`w-12 h-12 rounded-2xl flex items-center justify-center transition-all ${inputText.trim() ? 'bg-teal-600 text-white shadow-lg' : 'bg-slate-100 text-slate-300'}`}><i className="fa-solid fa-paper-plane text-xl"></i></button>
           </form>
         </footer>
       </main>
+
+      {/* Members Modal */}
+      {showMembersModal && (
+        <div className="fixed inset-0 bg-slate-900/70 backdrop-blur-md z-[110] flex items-center justify-center p-6">
+          <div className="bg-white rounded-[2.5rem] p-8 w-full max-w-sm shadow-2xl animate-in zoom-in duration-300">
+            <div className="flex justify-between items-center mb-6">
+              <h3 className="font-black text-xl text-slate-800">メンバー一覧</h3>
+              <button onClick={() => setShowMembersModal(false)} className="text-slate-400"><i className="fa-solid fa-xmark text-xl"></i></button>
+            </div>
+            <div className="space-y-4 max-h-[50vh] overflow-y-auto pr-2">
+              {roomMembers.map(member => (
+                <div key={member.id} className="flex items-center gap-3 p-2 hover:bg-slate-50 rounded-2xl transition-all">
+                  <img src={member.photoURL} className="w-10 h-10 rounded-full border-2 border-white shadow-sm" alt={member.name} />
+                  <div>
+                    <p className="font-black text-sm text-slate-700">{member.name}</p>
+                    <p className="text-[10px] text-slate-400">{member.email}</p>
+                  </div>
+                  {member.id === activeRoom?.createdBy && <span className="ml-auto text-[8px] bg-amber-100 text-amber-600 px-2 py-0.5 rounded-full font-black">管理者</span>}
+                </div>
+              ))}
+            </div>
+            <button onClick={() => setShowMembersModal(false)} className="w-full mt-6 py-4 bg-slate-100 text-slate-600 rounded-2xl font-black">閉じる</button>
+          </div>
+        </div>
+      )}
 
       {/* Create Room Modal */}
       {showCreateModal && (
         <div className="fixed inset-0 bg-slate-900/70 backdrop-blur-md z-[100] flex items-center justify-center p-6">
           <div className="bg-white rounded-[2.5rem] p-8 w-full max-w-sm shadow-2xl animate-in zoom-in duration-300">
-            <h3 className="font-black text-xl mb-4 text-slate-800">新しいルームを作成</h3>
-            <p className="text-xs text-slate-500 mb-6 italic leading-relaxed">作成したルームには招待コードが発行されます。<br/>他のスタッフに参加してもらう際に共有してください。</p>
-            <input 
-              value={newRoomName} 
-              onChange={e => setNewRoomName(e.target.value)} 
-              placeholder="例：受付連絡、オペ室" 
-              className="w-full p-4 bg-slate-100 rounded-2xl outline-none focus:ring-4 focus:ring-teal-100 mb-6 font-bold" 
-              autoFocus 
-              onKeyDown={e => e.key === 'Enter' && createRoom()}
-            />
+            <h3 className="font-black text-xl mb-4 text-slate-800">ルームを作成</h3>
+            <input value={newRoomName} onChange={e => setNewRoomName(e.target.value)} placeholder="例：受付連絡、オペ室" className="w-full p-4 bg-slate-100 rounded-2xl outline-none focus:ring-4 focus:ring-teal-100 mb-6 font-bold" autoFocus />
             <div className="flex gap-3">
               <button onClick={() => setShowCreateModal(false)} className="flex-1 py-4 font-black text-slate-400">閉じる</button>
-              <button 
-                onClick={createRoom} 
-                disabled={isProcessing || !newRoomName.trim()}
-                className="flex-1 py-4 bg-teal-600 text-white rounded-2xl font-black shadow-lg disabled:opacity-50"
-              >
-                {isProcessing ? '作成中...' : '作成する'}
-              </button>
+              <button onClick={createRoom} className="flex-1 py-4 bg-teal-600 text-white rounded-2xl font-black shadow-lg">作成</button>
             </div>
           </div>
         </div>
@@ -435,24 +454,11 @@ const App: React.FC = () => {
         <div className="fixed inset-0 bg-slate-900/70 backdrop-blur-md z-[100] flex items-center justify-center p-6">
           <div className="bg-white rounded-[2.5rem] p-8 w-full max-w-sm shadow-2xl animate-in zoom-in duration-300">
             <h3 className="font-black text-xl mb-2 text-slate-800">ルームに参加</h3>
-            <p className="text-xs text-slate-500 mb-6 leading-relaxed">共有された6桁のコードを入力してください。<br/>一度参加すると一覧に保存されます。</p>
-            <input 
-              value={joinCode} 
-              onChange={e => setJoinCode(e.target.value.toUpperCase())} 
-              maxLength={6} 
-              placeholder="ABCDEF" 
-              className="w-full p-5 bg-slate-100 rounded-2xl outline-none focus:ring-4 focus:ring-blue-100 mb-6 text-center font-mono text-3xl tracking-[0.4em] font-black" 
-              onKeyDown={e => e.key === 'Enter' && joinRoomByCode()}
-            />
+            <p className="text-xs text-slate-500 mb-6">6桁のコードを入力してください</p>
+            <input value={joinCode} onChange={e => setJoinCode(e.target.value.toUpperCase())} maxLength={6} placeholder="ABCDEF" className="w-full p-5 bg-slate-100 rounded-2xl outline-none mb-6 text-center font-mono text-3xl font-black" />
             <div className="flex gap-3">
               <button onClick={() => setShowJoinModal(false)} className="flex-1 py-4 font-black text-slate-400">閉じる</button>
-              <button 
-                onClick={joinRoomByCode} 
-                disabled={isProcessing || joinCode.length < 6}
-                className="flex-1 py-4 bg-blue-600 text-white rounded-2xl font-black shadow-lg disabled:opacity-50"
-              >
-                {isProcessing ? '照合中...' : '参加する'}
-              </button>
+              <button onClick={joinRoomByCode} className="flex-1 py-4 bg-blue-600 text-white rounded-2xl font-black shadow-lg">参加</button>
             </div>
           </div>
         </div>
@@ -462,34 +468,13 @@ const App: React.FC = () => {
       {summary && (
         <div className="fixed inset-0 bg-slate-900/70 backdrop-blur-md z-[200] flex items-center justify-center p-4">
           <div className="bg-white rounded-[2.5rem] w-full max-w-lg shadow-2xl overflow-hidden animate-in zoom-in duration-300">
-            <div className="p-8 bg-teal-600 text-white flex justify-between items-center relative shadow-lg">
-              <h3 className="font-black text-lg leading-tight"><i className="fa-solid fa-sparkles mr-2 animate-pulse"></i>AI 業務要約</h3>
-              <button onClick={() => setSummary(null)} className="w-10 h-10 flex items-center justify-center bg-white/10 rounded-full hover:bg-white/20 transition-all"><i className="fa-solid fa-xmark"></i></button>
-            </div>
+            <div className="p-8 bg-teal-600 text-white flex justify-between items-center"><h3 className="font-black text-lg">AI 業務要約</h3><button onClick={() => setSummary(null)} className="w-10 h-10 flex items-center justify-center bg-white/10 rounded-full"><i className="fa-solid fa-xmark"></i></button></div>
             <div className="p-8 space-y-6 max-h-[60vh] overflow-y-auto bg-white">
-              <div className="bg-teal-50 p-6 rounded-[2rem] text-sm text-slate-700 italic border-l-4 border-teal-400 shadow-inner leading-relaxed">
-                {summary.summary}
-              </div>
-              <div>
-                <h4 className="text-[10px] font-black text-amber-600 uppercase tracking-widest mb-3 flex items-center gap-2">
-                  <span className="w-3 h-3 bg-amber-400 rounded-full"></span>重要ポイント
-                </h4>
-                <ul className="space-y-2">
-                  {summary.keyPoints.map((p,i)=><li key={i} className="text-xs flex gap-2 font-bold text-slate-600"><i className="fa-solid fa-circle-check text-amber-500 mt-0.5"></i>{p}</li>)}
-                </ul>
-              </div>
-              <div>
-                <h4 className="text-[10px] font-black text-blue-600 uppercase tracking-widest mb-3 flex items-center gap-2">
-                  <span className="w-3 h-3 bg-blue-400 rounded-full"></span>次のアクション
-                </h4>
-                <ul className="space-y-2">
-                  {summary.actionItems.map((a,i)=><li key={i} className="text-xs flex gap-2 font-bold text-slate-600"><i className="fa-solid fa-arrow-right text-blue-500 mt-0.5"></i>{a}</li>)}
-                </ul>
-              </div>
+              <div className="bg-teal-50 p-6 rounded-[2rem] text-sm text-slate-700 italic border-l-4 border-teal-400 shadow-inner">{summary.summary}</div>
+              <div><h4 className="text-[10px] font-black text-amber-600 uppercase tracking-widest mb-3">重要ポイント</h4><ul className="space-y-2">{summary.keyPoints.map((p,i)=><li key={i} className="text-xs flex gap-2 font-bold text-slate-600"><i className="fa-solid fa-circle-check text-amber-500 mt-0.5"></i>{p}</li>)}</ul></div>
+              <div><h4 className="text-[10px] font-black text-blue-600 uppercase tracking-widest mb-3">次のアクション</h4><ul className="space-y-2">{summary.actionItems.map((a,i)=><li key={i} className="text-xs flex gap-2 font-bold text-slate-600"><i className="fa-solid fa-arrow-right text-blue-500 mt-0.5"></i>{a}</li>)}</ul></div>
             </div>
-            <div className="p-8 bg-slate-50 text-center border-t border-slate-100">
-              <button onClick={()=>setSummary(null)} className="px-16 py-4 bg-white border-2 border-slate-200 rounded-2xl font-black text-slate-500 hover:text-teal-600 hover:border-teal-400 transition-all shadow-sm active:scale-95">内容を確認しました</button>
-            </div>
+            <div className="p-8 bg-slate-50 text-center border-t"><button onClick={()=>setSummary(null)} className="px-16 py-4 bg-white border-2 border-slate-200 rounded-2xl font-black text-slate-500">確認しました</button></div>
           </div>
         </div>
       )}
