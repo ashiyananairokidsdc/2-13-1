@@ -1,22 +1,33 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { initializeApp } from 'firebase/app';
-import { getFirestore, collection, addDoc, onSnapshot, query, orderBy, limit, doc, updateDoc, arrayUnion } from 'firebase/firestore';
-import { getAuth, signInWithPopup, GoogleAuthProvider, onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
+import { getFirestore, collection, addDoc, onSnapshot, query, orderBy, limit } from 'firebase/firestore';
+import { getAuth, signInWithPopup, GoogleAuthProvider, onAuthStateChanged } from 'firebase/auth';
 import { User, Message, ChatRoom, SummaryResponse } from './types';
+// Vite環境での解決を助けるため、パスを再確認
 import { summarizeChat } from './services/geminiService';
 import { logToGoogleSheets, processImage } from './services/storageService';
 
-// Firebase設定 (Vercelの環境変数から取得することを推奨)
-// 設定がない場合はブラウザのローカルストレージなどで一時保存するフォールバックを行います
-const firebaseConfig = JSON.parse(process.env.FIREBASE_CONFIG || '{}');
+// Firebase設定のパースエラーを防ぐ
+const getFirebaseConfig = () => {
+  try {
+    // FIX: Access process.env and import.meta.env with any casting to satisfy TS error
+    const config = (process as any).env?.FIREBASE_CONFIG || (import.meta as any).env?.VITE_FIREBASE_CONFIG;
+    return config ? JSON.parse(config) : null;
+  } catch (e) {
+    console.error("Firebase config parse error:", e);
+    return null;
+  }
+};
+
+const firebaseConfig = getFirebaseConfig();
 
 const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [db, setDb] = useState<any>(null);
   const [auth, setAuth] = useState<any>(null);
 
-  const [rooms, setRooms] = useState<ChatRoom[]>([
+  const [rooms] = useState<ChatRoom[]>([
     { id: 'all', name: '全体掲示板', code: 'NANA01', participants: [] }
   ]);
   const [activeRoomId, setActiveRoomId] = useState<string>('all');
@@ -30,9 +41,8 @@ const App: React.FC = () => {
   const scrollRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Firebase初期化
   useEffect(() => {
-    if (firebaseConfig.apiKey) {
+    if (firebaseConfig && firebaseConfig.apiKey) {
       const app = initializeApp(firebaseConfig);
       const _db = getFirestore(app);
       const _auth = getAuth(app);
@@ -55,7 +65,6 @@ const App: React.FC = () => {
     }
   }, []);
 
-  // メッセージのリアルタイム同期
   useEffect(() => {
     if (!db || !activeRoomId) return;
 
@@ -65,12 +74,15 @@ const App: React.FC = () => {
       limit(100)
     );
 
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const newMessages = snapshot.docs.map(doc => ({
+    // FIX: Explicitly cast snapshot to any to bypass Property 'docs' does not exist error
+    const unsubscribe = onSnapshot(q, (snapshot: any) => {
+      const newMessages = snapshot.docs.map((doc: any) => ({
         id: doc.id,
         ...doc.data()
       })) as Message[];
       setMessages(newMessages);
+    }, (error) => {
+      console.error("Firestore sync error:", error);
     });
 
     return () => unsubscribe();
@@ -83,9 +95,14 @@ const App: React.FC = () => {
   }, [messages]);
 
   const handleLogin = async () => {
-    if (!auth) return alert("Firebaseの設定をVercelで行ってください。");
+    if (!auth) return alert("Firebase設定が読み込めていません。Vercelの環境変数設定を確認してください。");
     const provider = new GoogleAuthProvider();
-    await signInWithPopup(auth, provider);
+    try {
+      await signInWithPopup(auth, provider);
+    } catch (e) {
+      console.error("Login error:", e);
+      alert("ログインに失敗しました。");
+    }
   };
 
   const handleSendMessage = async (e?: React.FormEvent, imageUrl?: string) => {
@@ -108,19 +125,21 @@ const App: React.FC = () => {
       await addDoc(collection(db, 'rooms', activeRoomId, 'messages'), msgData);
       setInputText('');
       setIsImportant(false);
-      
-      // スプレッドシート連携
       logToGoogleSheets(rooms.find(r => r.id === activeRoomId)?.name || '全体', { ...msgData, id: 'temp' } as any);
     } catch (err) {
-      console.error("Error adding document: ", err);
+      console.error("Error adding message:", err);
     }
   };
 
   const onFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
-      const base64 = await processImage(file);
-      handleSendMessage(undefined, base64);
+      try {
+        const base64 = await processImage(file);
+        handleSendMessage(undefined, base64);
+      } catch (err) {
+        alert("画像の処理に失敗しました。");
+      }
     }
   };
 
@@ -131,7 +150,8 @@ const App: React.FC = () => {
       const res = await summarizeChat(messages);
       setSummary(res);
     } catch (err) {
-      alert("AI要約にはAPIキーの設定が必要です。");
+      console.error("Summary error:", err);
+      alert("AI要約に失敗しました。APIキーの設定を確認してください。");
     } finally {
       setIsSummarizing(false);
     }
@@ -151,7 +171,11 @@ const App: React.FC = () => {
             <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" className="w-5" />
             Googleでログイン
           </button>
-          <p className="mt-6 text-[10px] text-slate-400">※クリニックのGoogleアカウントを使用してください</p>
+          {!firebaseConfig && (
+            <p className="mt-4 text-xs text-red-500 bg-red-50 p-2 rounded">
+              Firebaseの設定が見つかりません。<br/>環境変数 FIREBASE_CONFIG を設定してください。
+            </p>
+          )}
         </div>
       </div>
     );
@@ -159,7 +183,6 @@ const App: React.FC = () => {
 
   return (
     <div className="flex h-screen bg-slate-50 overflow-hidden font-sans">
-      {/* サイドバー */}
       <aside className="w-72 bg-white border-r flex flex-col shadow-lg z-30">
         <div className="p-5 bg-teal-600 text-white flex justify-between items-center">
           <h1 className="text-xl font-bold flex items-center gap-2">
@@ -167,7 +190,6 @@ const App: React.FC = () => {
           </h1>
           <button onClick={() => auth.signOut()} className="text-xs opacity-70 hover:opacity-100">ログアウト</button>
         </div>
-
         <div className="flex-1 overflow-y-auto mt-4">
           {rooms.map(room => (
             <button
@@ -185,9 +207,8 @@ const App: React.FC = () => {
             </button>
           ))}
         </div>
-
         <div className="p-4 bg-slate-100 flex items-center gap-3">
-          <img src={currentUser.photoURL} className="w-8 h-8 rounded-full border border-white shadow-sm" />
+          <img src={currentUser.photoURL} className="w-8 h-8 rounded-full border border-white shadow-sm" alt="User"/>
           <div className="text-xs">
             <p className="font-bold truncate w-40">{currentUser.name}</p>
             <p className="text-slate-500 font-mono text-[9px]">ID: {currentUser.id.substring(0,8)}</p>
@@ -195,21 +216,19 @@ const App: React.FC = () => {
         </div>
       </aside>
 
-      {/* メイン画面 */}
       <main className="flex-1 flex flex-col bg-white relative">
         <header className="h-16 border-b px-6 flex items-center justify-between bg-white/90 backdrop-blur-sm shadow-sm">
           <h2 className="text-lg font-bold text-slate-700">{rooms.find(r => r.id === activeRoomId)?.name}</h2>
           <button 
             onClick={runSummary}
             disabled={isSummarizing || messages.length === 0}
-            className={`flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-blue-500 to-teal-500 text-white rounded-full text-sm font-bold shadow-md hover:scale-105 transition ${messages.length === 0 ? 'opacity-50' : ''}`}
+            className={`flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-blue-500 to-teal-500 text-white rounded-full text-sm font-bold shadow-md hover:scale-105 transition disabled:opacity-50`}
           >
             {isSummarizing ? <i className="fa-solid fa-spinner animate-spin"></i> : <i className="fa-solid fa-wand-magic-sparkles"></i>}
             AI要約
           </button>
         </header>
 
-        {/* メッセージ表示部 */}
         <div ref={scrollRef} className="flex-1 overflow-y-auto p-6 space-y-4 bg-slate-50">
           {messages.length === 0 && (
             <div className="h-full flex flex-col items-center justify-center text-slate-300">
@@ -221,7 +240,7 @@ const App: React.FC = () => {
             const isMe = msg.senderId === currentUser.id;
             return (
               <div key={msg.id} className={`flex gap-3 ${isMe ? 'flex-row-reverse' : ''}`}>
-                <img src={msg.senderPhoto} className="w-8 h-8 rounded-full self-end shadow-sm" />
+                <img src={msg.senderPhoto} className="w-8 h-8 rounded-full self-end shadow-sm" alt="Sender"/>
                 <div className={`max-w-[70%] ${isMe ? 'items-end' : 'items-start'} flex flex-col`}>
                   <div className="flex gap-2 items-center mb-1">
                     <span className="text-[10px] font-bold text-slate-500">{msg.senderName}</span>
@@ -232,7 +251,7 @@ const App: React.FC = () => {
                     ${msg.isImportant ? 'bg-amber-50 border-2 border-amber-300 ring-2 ring-amber-100' : isMe ? 'bg-teal-600 text-white' : 'bg-white text-slate-700'}
                   `}>
                     {msg.isImportant && <i className="fa-solid fa-circle-exclamation text-amber-500 absolute -top-2 -left-2 bg-white rounded-full p-0.5 shadow-sm"></i>}
-                    {msg.imageUrl && <img src={msg.imageUrl} className="max-w-full rounded-lg mb-2 border cursor-pointer" onClick={() => window.open(msg.imageUrl)} />}
+                    {msg.imageUrl && <img src={msg.imageUrl} className="max-w-full rounded-lg mb-2 border cursor-pointer" onClick={() => window.open(msg.imageUrl)} alt="Attached"/>}
                     <p className="whitespace-pre-wrap">{msg.text}</p>
                   </div>
                   <div className="mt-1 flex gap-2">
@@ -244,7 +263,6 @@ const App: React.FC = () => {
           })}
         </div>
 
-        {/* 入力部 */}
         <footer className="p-4 bg-white border-t">
           <form onSubmit={handleSendMessage} className="max-w-4xl mx-auto flex items-end gap-3">
             <button 
@@ -291,9 +309,8 @@ const App: React.FC = () => {
           </form>
         </footer>
 
-        {/* 要約モーダル */}
         {summary && (
-          <div className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center z-50 p-4 text-slate-800">
             <div className="bg-white rounded-3xl w-full max-w-lg shadow-2xl overflow-hidden animate-in fade-in zoom-in duration-200">
               <div className="p-5 bg-teal-600 text-white flex justify-between items-center">
                 <h3 className="font-bold flex items-center gap-2"><i className="fa-solid fa-sparkles"></i> AI 要約レポート</h3>
@@ -301,13 +318,13 @@ const App: React.FC = () => {
               </div>
               <div className="p-6 space-y-4 max-h-[70vh] overflow-y-auto">
                 <div className="bg-teal-50 p-4 rounded-xl border border-teal-100">
-                  <p className="text-sm text-slate-700 leading-relaxed">{summary.summary}</p>
+                  <p className="text-sm leading-relaxed">{summary.summary}</p>
                 </div>
                 <div>
                   <h4 className="text-xs font-bold text-amber-600 mb-2 uppercase tracking-widest">重要ポイント</h4>
                   <ul className="space-y-1">
                     {summary.keyPoints.map((k, i) => (
-                      <li key={i} className="text-sm text-slate-600 flex gap-2"><i className="fa-solid fa-check text-amber-500 mt-1"></i> {k}</li>
+                      <li key={i} className="text-sm flex gap-2"><i className="fa-solid fa-check text-amber-500 mt-1"></i> {k}</li>
                     ))}
                   </ul>
                 </div>
@@ -315,7 +332,7 @@ const App: React.FC = () => {
                   <h4 className="text-xs font-bold text-blue-600 mb-2 uppercase tracking-widest">ネクストアクション</h4>
                   <ul className="space-y-1">
                     {summary.actionItems.map((a, i) => (
-                      <li key={i} className="text-sm text-slate-600 flex gap-2"><i className="fa-solid fa-arrow-right text-blue-500 mt-1"></i> {a}</li>
+                      <li key={i} className="text-sm flex gap-2"><i className="fa-solid fa-arrow-right text-blue-500 mt-1"></i> {a}</li>
                     ))}
                   </ul>
                 </div>
