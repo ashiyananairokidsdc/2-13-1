@@ -16,17 +16,16 @@ export interface Message {
   imageUrl?: string;
   timestamp: number;
   isImportant: boolean;
-  readBy: string[]; // User IDs
+  readBy: string[];
 }
 
 export interface ChatRoom {
   id: string;
   name: string;
   code: string;
-  participants: string[]; // User IDs
-  lastMessage?: string;
-  lastTimestamp?: number;
-  unreadCount?: number;
+  createdBy: string;
+  createdAt: number;
+  participants: string[];
 }
 
 export interface SummaryResponse {
