@@ -3,12 +3,10 @@ import React, { useState, useEffect, useRef } from 'react';
 import { initializeApp } from 'firebase/app';
 import { getFirestore, collection, addDoc, onSnapshot, query, orderBy, limit } from 'firebase/firestore';
 import { getAuth, signInWithPopup, GoogleAuthProvider, onAuthStateChanged } from 'firebase/auth';
-import { User, Message, ChatRoom, SummaryResponse } from './types.ts';
-// 拡張子 .ts を追加してビルドエラーを回避
-import { summarizeChat } from './services/geminiService.ts';
-import { logToGoogleSheets, processImage } from './services/storageService.ts';
+import { User, Message, ChatRoom, SummaryResponse } from './types';
+import { summarizeChat } from './geminiService';
+import { logToGoogleSheets, processImage } from './storageService';
 
-// Firebase設定のパースエラーを防ぐ
 const getFirebaseConfig = () => {
   try {
     const config = (process as any).env?.FIREBASE_CONFIG || (import.meta as any).env?.VITE_FIREBASE_CONFIG;
